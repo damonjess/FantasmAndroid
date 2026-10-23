@@ -1,263 +1,225 @@
 package com.example.fantasmandroid
 
 import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.Text
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.example.fantasmandroid.ui.FantasmApp
+import com.example.fantasmandroid.ui.theme.AccentGreen
+import com.example.fantasmandroid.ui.theme.FantasmAndroidTheme
+import com.example.fantasmandroid.ui.theme.FantasmDisplay
+import com.example.fantasmandroid.ui.theme.Hairline
+import com.example.fantasmandroid.ui.theme.IceWhite
+import com.example.fantasmandroid.ui.theme.Ink
+import com.example.fantasmandroid.ui.theme.SignalGreen
+import com.example.fantasmandroid.ui.theme.TextDim
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
-    private lateinit var sensorEngine: ParanormalSensorEngine
+
+    private lateinit var controller: FantasmController
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        sensorEngine = ParanormalSensorEngine(this)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            // Keep the Android status bar visible so the HUD sits below it like the reference device.
+            hide(WindowInsetsCompat.Type.navigationBars())
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            isAppearanceLightStatusBars = false
+        }
+        controller = FantasmController(applicationContext)
 
         setContent {
-            var permissionsGranted by remember { mutableStateOf(false) }
-            val launcher = rememberLauncherForActivityResult(
-                ActivityResultContracts.RequestMultiplePermissions()
-            ) { results ->
-                permissionsGranted = results.values.all { it }
-                if (permissionsGranted) sensorEngine.start(enableAudio = true)
-            }
+            FantasmAndroidTheme {
+                val context = LocalContext.current
+                var granted by remember { mutableStateOf(hasRequiredPermissions(context)) }
+                val launcher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestMultiplePermissions()
+                ) {
+                    granted = hasRequiredPermissions(context)
+                }
 
-            LaunchedEffect(Unit) {
-                launcher.launch(
-                    arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
-                )
-            }
+                LaunchedEffect(Unit) {
+                    if (!granted) launcher.launch(REQUIRED_PERMISSIONS)
+                }
+                LaunchedEffect(granted) {
+                    if (granted) {
+                        controller.stop()
+                        controller.start()
+                    } else {
+                        controller.stop()
+                    }
+                }
 
-            FantasmScreen(sensorEngine = sensorEngine)
+                if (granted) {
+                    FantasmApp(controller)
+                } else {
+                    PermissionGate(
+                        onRequest = { launcher.launch(REQUIRED_PERMISSIONS) },
+                        onOpenSettings = {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(
+                                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                        Uri.fromParts("package", context.packageName, null)
+                                    )
+                                )
+                            }
+                        }
+                    )
+                }
+            }
         }
     }
 
     override fun onResume() {
         super.onResume()
-        // Automatically resume sensors and mic when the app is focused
-        sensorEngine.start(enableAudio = true)
+        if (hasRequiredPermissions(this)) controller.start()
     }
 
     override fun onPause() {
         super.onPause()
-        sensorEngine.stop()
+        // Leaving the device screen or backgrounding the app ends an in-flight session cleanly.
+        if (controller.sessionManager.active.value != null) {
+            lifecycleScope.launch { controller.sessionManager.stop() }
+        }
+        controller.stop()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        sensorEngine.stop()
+        controller.shutdown()
     }
-}
 
-@Composable
-fun FantasmScreen(sensorEngine: ParanormalSensorEngine) {
-    val emfHistory by sensorEngine.emfHistory.collectAsState()
-    val geoHistory by sensorEngine.geoHistory.collectAsState()
-    val audioBands by sensorEngine.audioBands.collectAsState()
-    val itcPhrase by sensorEngine.itcPhrase.collectAsState()
-
-    var voxEnabled by remember { mutableStateOf(false) }
-    var slsEnabled by remember { mutableStateOf(true) }
-    var twilightEnabled by remember { mutableStateOf(false) }
-    var flipEnabled by remember { mutableStateOf(false) }
-
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // 1. Live Camera + SLS Stick-Figure Layer
-        SlsCameraPreview(
-            slsEnabled = slsEnabled,
-            twilightEnabled = twilightEnabled,
-            flipCamera = flipEnabled
+    private companion object {
+        val REQUIRED_PERMISSIONS = arrayOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
         )
 
-        // 2. HUD Overlay Column
-        Column(
-            modifier = Modifier.fillMaxSize(),
-            verticalArrangement = Arrangement.SpaceBetween
-        ) {
-            // Top Header & ITC Word Banner
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0x99222222))
-                    .padding(top = 12.dp, bottom = 16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    text = "FANTASM",
-                    color = Color.White,
-                    fontSize = 26.sp,
-                    fontFamily = FontFamily.Serif,
-                    letterSpacing = 4.sp
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    text = itcPhrase,
-                    color = Color(0xFFE0E0E0),
-                    fontSize = 28.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Light,
-                    letterSpacing = 6.sp
-                )
+        fun hasRequiredPermissions(context: android.content.Context): Boolean =
+            REQUIRED_PERMISSIONS.all {
+                ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
             }
-
-            // Bottom Instrument Panel & Controls
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xCC383430))
-                    .navigationBarsPadding() // <-- Prevents buttons from sliding under system nav keys
-                    .padding(8.dp)
-            ) {
-                // EMF Bar Graph (Magnet)
-                InstrumentRow(iconLabel = "🧲") {
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val barWidth = size.width / emfHistory.size
-                        emfHistory.forEachIndexed { idx, value ->
-                            val barHeight = value * size.height
-                            drawRect(
-                                color = if (value > 0.6f) Color.Red else Color(0xFF00FF44),
-                                topLeft = Offset(idx * barWidth, size.height - barHeight),
-                                size = Size(barWidth * 0.7f, barHeight)
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(6.dp))
-
-                // Audio VU LED Matrix (Microphone)
-                InstrumentRow(iconLabel = "🎙️", height = 90.dp) {
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val cols = audioBands.size
-                        val rows = 8
-                        val cellW = size.width / cols
-                        val cellH = size.height / rows
-
-                        audioBands.forEachIndexed { col, level ->
-                            val activeRows = (level * rows).toInt()
-                            for (row in 0 until activeRows) {
-                                val color = when {
-                                    row >= 6 -> Color.Red
-                                    row >= 4 -> Color.Yellow
-                                    else -> Color(0xFF00FF00)
-                                }
-                                drawRect(
-                                    color = color,
-                                    topLeft = Offset(col * cellW + 2f, size.height - (row + 1) * cellH + 2f),
-                                    size = Size(cellW - 4f, cellH - 4f)
-                                )
-                            }
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(6.dp))
-
-                // Geo Seismograph Waveform (Globe)
-                InstrumentRow(iconLabel = "🌍") {
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val path = Path()
-                        val stepX = size.width / (geoHistory.size - 1).coerceAtLeast(1)
-                        val midY = size.height / 2f
-
-                        geoHistory.forEachIndexed { idx, value ->
-                            val x = idx * stepX
-                            val y = midY - (value * midY * 0.9f)
-                            if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                        }
-                        drawPath(path = path, color = Color.Cyan, style = Stroke(width = 3f))
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Bottom Pill Toggles (VOX, FLIP, SLS, TWILIGHT)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly
-                ) {
-                    FantasmToggle("VOX", voxEnabled) {
-                        voxEnabled = !voxEnabled
-                        sensorEngine.setVoxEnabled(voxEnabled)
-                    }
-                    FantasmToggle("FLIP", flipEnabled) { flipEnabled = !flipEnabled }
-                    FantasmToggle("SLS", slsEnabled) { slsEnabled = !slsEnabled }
-                    FantasmToggle("TWILIGHT", twilightEnabled) { twilightEnabled = !twilightEnabled }
-                }
-            }
-        }
     }
 }
 
 @Composable
-fun InstrumentRow(
-    iconLabel: String,
-    height: androidx.compose.ui.unit.Dp = 52.dp,
-    content: @Composable BoxScope.() -> Unit
-) {
-    Row(
+private fun PermissionGate(onRequest: () -> Unit, onOpenSettings: () -> Unit) {
+    Column(
         modifier = Modifier
-            .fillMaxWidth()
-            .height(height)
-            .border(1.dp, Color.Gray)
-            .background(Color(0xFF1E1E1E))
-            .padding(4.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .fillMaxSize()
+            .background(Ink)
+            .statusBarsPadding()
+            .padding(horizontal = 30.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
         Text(
-            text = iconLabel,
-            fontSize = 22.sp,
-            modifier = Modifier.padding(horizontal = 8.dp)
+            text = "FANTASM",
+            color = IceWhite,
+            fontFamily = FantasmDisplay,
+            fontSize = 34.sp,
+            letterSpacing = 7.sp
         )
-        Box(modifier = Modifier.fillMaxSize(), content = content)
-    }
-}
-
-@Composable
-fun FantasmToggle(label: String, enabled: Boolean, onClick: () -> Unit) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(text = label, color = Color.LightGray, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-        Text(text = "enable", color = Color.Gray, fontSize = 9.sp)
-        Spacer(modifier = Modifier.height(4.dp))
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = "PARANORMAL RESEARCH DEVICE",
+            color = AccentGreen.copy(alpha = 0.8f),
+            fontSize = 9.sp,
+            letterSpacing = 2.sp
+        )
+        Spacer(Modifier.height(40.dp))
+        Text(
+            text = "CAMERA + MICROPHONE ACCESS",
+            color = IceWhite,
+            fontSize = 13.sp,
+            letterSpacing = 1.5.sp,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = "Fantasm needs the camera for SLS tracking, depth rendering and Twilight vision, " +
+                "and the microphone for the frequency spectrum, EVP capture and ITC responses. " +
+                "Everything is processed on this device and never uploaded.",
+            color = TextDim,
+            fontSize = 12.sp,
+            lineHeight = 19.sp,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(30.dp))
         Box(
             modifier = Modifier
-                .width(50.dp)
-                .height(80.dp)
-                .clip(RoundedCornerShape(25.dp))
-                .border(2.dp, Color.LightGray, RoundedCornerShape(25.dp))
-                .background(Color(0xFF2B2B2B))
-                .clickable { onClick() }
-                .padding(6.dp),
-            contentAlignment = if (enabled) Alignment.BottomCenter else Alignment.TopCenter
+                .fillMaxWidth()
+                .height(46.dp)
+                .border(1.dp, SignalGreen.copy(alpha = 0.8f))
+                .clickable(onClick = onRequest),
+            contentAlignment = Alignment.Center
         ) {
-            Box(
-                modifier = Modifier
-                    .size(34.dp)
-                    .clip(CircleShape)
-                    .background(if (enabled) Color(0xFF00FF44) else Color.Gray)
+            Text(
+                text = "ALLOW ACCESS",
+                color = SignalGreen,
+                fontSize = 12.sp,
+                letterSpacing = 2.sp
             )
         }
+        Spacer(Modifier.height(14.dp))
+        Text(
+            text = "OPEN APP SETTINGS",
+            color = TextDim,
+            fontSize = 10.sp,
+            letterSpacing = 1.5.sp,
+            modifier = Modifier
+                .clickable(onClick = onOpenSettings)
+                .padding(8.dp)
+        )
+        Spacer(Modifier.height(40.dp))
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline.copy(alpha = 0.3f)))
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = "For entertainment purposes only. Fantasm cannot prove or disprove the paranormal.",
+            color = TextDim.copy(alpha = 0.7f),
+            fontSize = 9.sp,
+            textAlign = TextAlign.Center
+        )
     }
 }

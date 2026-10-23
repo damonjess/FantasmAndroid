@@ -53,9 +53,13 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
+    implementation("androidx.camera:camera-video:$cameraxVersion")
 
     // Google ML Kit Pose Detection (SLS Skeletal Tracking)
     implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
+
+    // ML Kit selfie segmentation - drives the depth / FLIR style false-colour render
+    implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
 
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

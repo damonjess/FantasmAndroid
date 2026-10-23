@@ -1,77 +1,85 @@
 package com.example.fantasmandroid
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
-import android.speech.tts.TextToSpeech
-import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.util.Locale
 import kotlin.math.sqrt
-import kotlin.random.Random
 
+/**
+ * Magnetometer (EMF) and accelerometer (geophone) pipeline for the device HUD.
+ * Levels are normalised against a slowly adapting room baseline so the meters
+ * respond to changes in the field rather than a fixed ambient value.
+ */
 class ParanormalSensorEngine(context: Context) : SensorEventListener {
+
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
-    private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+    private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
-    // Dynamic baseline EMF adaptation
-    private var baselineEmf = 45f
+    val hasMagnetometer: Boolean = magnetometer != null
 
-    // Rolling histories for the UI graphs (last 50 ticks)
-    private val _emfHistory = MutableStateFlow(List(50) { 0f })
-    val emfHistory = _emfHistory.asStateFlow()
+    private val _emfLevel = MutableStateFlow(0.05f)
+    val emfLevel: StateFlow<Float> = _emfLevel.asStateFlow()
 
-    private val _geoHistory = MutableStateFlow(List(50) { 0f })
-    val geoHistory = _geoHistory.asStateFlow()
+    private val _emfHistory = MutableStateFlow(List(EMF_POINTS) { 0f })
+    val emfHistory: StateFlow<List<Float>> = _emfHistory.asStateFlow()
 
-    // 16-band audio visualizer levels (0f to 1f)
-    private val _audioBands = MutableStateFlow(List(16) { 0f })
-    val audioBands = _audioBands.asStateFlow()
+    private val _geoHistory = MutableStateFlow(List(GEO_POINTS) { 0f })
+    val geoHistory: StateFlow<List<Float>> = _geoHistory.asStateFlow()
 
-    // Spirit Box ITC phrase output
-    private val _itcPhrase = MutableStateFlow("WAITING FOR YOU")
-    val itcPhrase = _itcPhrase.asStateFlow()
+    private val _geoEnergy = MutableStateFlow(0f)
+    val geoEnergy: StateFlow<Float> = _geoEnergy.asStateFlow()
 
-    private var audioJob: Job? = null
-    private var tts: TextToSpeech? = null
-    private var voxEnabled = false
+    /** Fired when the local magnetic field moves sharply away from baseline. */
+    var onReading: ((level: Float, spike: Boolean) -> Unit)? = null
 
-    private val wordBank = listOf(
-        "WAITING FOR YOU", "BEHIND YOU", "GET OUT", "IM HERE",
-        "COLD", "LISTEN", "HELP ME", "WATCHING", "DARKNESS", "HELLO"
-    )
+    private var baseline = -1f
+    private var lastMagnitude = 42f
+    private var smoothedLevel = 0.05f
+    private var lastSpikeAt = 0L
+    private var lastEmitAt = 0L
+    private var historyEmitAt = 0L
+    private var lastGeoEmitAt = 0L
+    private var emfBuffer = ArrayDeque<Float>()
+    private var geoBuffer = ArrayDeque<Float>()
+    private val gravity = FloatArray(3)
+    private var running = false
 
     init {
-        tts = TextToSpeech(context) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                tts?.language = Locale.UK
-                tts?.setPitch(0.6f) // Lower pitch for eerie Vox effect
-                tts?.setSpeechRate(0.75f)
-            }
+        repeat(EMF_POINTS) { emfBuffer.addLast(0f) }
+        repeat(GEO_POINTS) { geoBuffer.addLast(0f) }
+    }
+
+    fun start() {
+        if (running) return
+        running = true
+        magnetometer?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+        accelerometer?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+        gyroscope?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
     }
 
-    fun start(enableAudio: Boolean) {
-        magnetometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-        accelerometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-        if (enableAudio) startAudioCapture()
-    }
-
-    fun setVoxEnabled(enabled: Boolean) {
-        voxEnabled = enabled
-    }
-
     fun stop() {
+        running = false
         sensorManager.unregisterListener(this)
-        audioJob?.cancel()
+    }
+
+    /** Re-zeroes the ambient magnetic baseline for the current room. */
+    fun calibrate() {
+        baseline = lastMagnitude
+        smoothedLevel = 0.18f
+        _emfLevel.value = smoothedLevel
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
@@ -82,91 +90,72 @@ class ParanormalSensorEngine(context: Context) : SensorEventListener {
                 val y = event.values[1]
                 val z = event.values[2]
                 val magnitude = sqrt(x * x + y * y + z * z)
+                if (magnitude <= 0f) return
+                lastMagnitude = magnitude
 
-                // Slowly adapt baseline to local ambient room interference
-                baselineEmf = (baselineEmf * 0.98f) + (magnitude * 0.02f)
+                // First reading seeds the room baseline, then it adapts slowly.
+                if (baseline < 0f) baseline = magnitude
+                baseline += (magnitude - baseline) * 0.0035f
+                val delta = magnitude - baseline
+                val target = (0.18f + delta / 50f).coerceIn(0.03f, 1f)
 
-                // Fluctuation relative to the current room baseline
-                val delta = magnitude - baselineEmf
-                val normalized = (0.25f + (delta / 40f)).coerceIn(0.05f, 1f)
+                val now = System.currentTimeMillis()
+                val spike = delta > 9f && now - lastSpikeAt > 1_100L
+                if (spike) lastSpikeAt = now
 
-                _emfHistory.value = (_emfHistory.value.drop(1) + normalized)
-
-                if (delta > 25f && Random.nextFloat() < 0.08f) {
-                    triggerItcWord()
+                smoothedLevel = smoothedLevel * 0.72f + target * 0.28f
+                if (now - lastEmitAt > 50) {
+                    lastEmitAt = now
+                    _emfLevel.value = smoothedLevel
+                    onReading?.invoke(smoothedLevel, spike)
+                }
+                if (now - historyEmitAt > 90) {
+                    historyEmitAt = now
+                    emfBuffer.addLast(smoothedLevel)
+                    while (emfBuffer.size > EMF_POINTS) emfBuffer.removeFirst()
+                    _emfHistory.value = emfBuffer.toList()
                 }
             }
-            Sensor.TYPE_LINEAR_ACCELERATION -> {
-                val x = event.values[0]
-                val y = event.values[1]
-                val z = event.values[2]
-                val vibration = sqrt(x * x + y * y + z * z)
-                val normalized = (vibration / 5f).coerceIn(-1f, 1f)
-                _geoHistory.value = (_geoHistory.value.drop(1) + normalized)
+
+            Sensor.TYPE_ACCELEROMETER -> {
+                // High-pass the gravity component so the trace shows movement.
+                for (i in 0..2) {
+                    gravity[i] = gravity[i] * 0.9f + event.values[i] * 0.1f
+                }
+                val lx = event.values[0] - gravity[0]
+                val ly = event.values[1] - gravity[1]
+                val lz = event.values[2] - gravity[2]
+                val magnitude = sqrt(lx * lx + ly * ly + lz * lz)
+                val signed = (magnitude / 4.5f).coerceIn(0f, 1f) * (if (ly >= 0f) 1f else -1f)
+
+                val now = System.currentTimeMillis()
+                if (now - lastGeoEmitAt > 40) {
+                    lastGeoEmitAt = now
+                    geoBuffer.addLast(signed)
+                    while (geoBuffer.size > GEO_POINTS) geoBuffer.removeFirst()
+                    _geoHistory.value = geoBuffer.toList()
+                    _geoEnergy.value = magnitude.coerceIn(0f, 1f)
+                }
             }
-        }
-    }
 
-    private fun triggerItcWord() {
-        val nextWord = wordBank.random()
-        if (_itcPhrase.value != nextWord) {
-            _itcPhrase.value = nextWord
-            if (voxEnabled) {
-                tts?.speak(nextWord, TextToSpeech.QUEUE_FLUSH, null, "ITC_ID")
-            }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun startAudioCapture() {
-        audioJob?.cancel()
-        audioJob = CoroutineScope(Dispatchers.IO).launch {
-            val sampleRate = 44100
-            val minBuf = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-            val bufferSize = if (minBuf > 0) minBuf else 2048
-
-            val recorder = try {
-                AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
+            Sensor.TYPE_GYROSCOPE -> {
+                // Rotational energy nudges the geophone trace when the device is moved.
+                val spin = sqrt(
+                    event.values[0] * event.values[0] +
+                        event.values[1] * event.values[1] +
+                        event.values[2] * event.values[2]
                 )
-            } catch (e: Exception) {
-                null
-            }
-
-            recorder?.startRecording()
-            val buffer = ShortArray(bufferSize)
-
-            while (isActive && recorder?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                val read = recorder.read(buffer, 0, bufferSize)
-                if (read > 0) {
-                    val chunkSize = (read / 16).coerceAtLeast(1)
-                    val bands = List(16) { bandIdx ->
-                        var sum = 0.0
-                        val start = bandIdx * chunkSize
-                        val end = (start + chunkSize).coerceAtMost(read)
-                        for (i in start until end) {
-                            sum += buffer[i] * buffer[i]
-                        }
-                        val rms = sqrt(sum / (end - start).coerceAtLeast(1))
-                        // Lower divisor so quiet room audio still lights up lower green bars
-                        (rms.toFloat() / 1800f).coerceIn(0.08f, 1f)
-                    }
-                    _audioBands.value = bands
+                if (spin > 1.2f) {
+                    _geoEnergy.value = (_geoEnergy.value * 0.8f + (spin / 8f).coerceAtMost(1f) * 0.2f)
                 }
-                delay(30)
             }
-            recorder?.stop()
-            recorder?.release()
         }
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+
+    private companion object {
+        const val EMF_POINTS = 48
+        const val GEO_POINTS = 72
+    }
 }
